@@ -1,16 +1,23 @@
 {
   "name": "yayauptime-worker",
   "version": "1.0.0",
-  "description": "",
+  "description": "YAYA Uptime Bot Worker - Visual Diff Monitoring",
   "main": "index.js",
   "scripts": {
+    "start": "node index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "dotenv": "^17.3.1"
+    "@aws-sdk/client-s3": "^3.997.0",
+    "@supabase/supabase-js": "^2.97.0",
+    "dotenv": "^17.3.1",
+    "pixelmatch": "^7.1.0",
+    "pngjs": "^7.0.0",
+    "puppeteer": "^24.37.5"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yayaone-web/yayauptime-worker.git"
   }
 }
