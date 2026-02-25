@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 /**
- * YAYA Uptime — Bot Worker (MVP v2)
- * Monitors store homepages: screenshot, compare to baseline, alert on changes.
+ * YAYA Uptime — Bot Worker (MVP v2 + Day 4 Email Alerts)
+ * Monitors store homepages: screenshot, compare to baseline, alert + EMAIL on changes.
+ * Updated February 25, 2026
  */
 
 require('dotenv').config();
@@ -9,11 +10,15 @@ const { createClient } = require('@supabase/supabase-js');
 const puppeteer = require('puppeteer');
 const { S3Client, GetObjectCommand, PutObjectCommand } = require('@aws-sdk/client-s3');
 const { PNG } = require('pngjs');
+const { Resend } = require('resend');
 
 const pixelmatchModule = require('pixelmatch');
 const pixelmatch = pixelmatchModule.default || pixelmatchModule;
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+const resend = new Resend(process.env.RESEND_API_KEY);
+
+// Service role key (required for fetching user emails)
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
 const s3 = new S3Client({
   region: 'auto',
@@ -119,6 +124,76 @@ function compareImages(baselineBuffer, newBuffer) {
   };
 }
 
+// ==================== DAY 4: EMAIL ALERT FUNCTION ====================
+async function sendAlertEmail(alert) {
+  try {
+    const { data: store } = await supabase
+      .from('stores')
+      .select('url, user_id')
+      .eq('id', alert.store_id)
+      .single();
+
+    if (!store || !store.user_id) return;
+
+    const { data: { user } } = await supabase.auth.admin.getUserById(store.user_id);
+    if (!user?.email) {
+      logError('No email found for user ' + store.user_id);
+      return;
+    }
+
+    const html = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <title>YAYA Uptime Alert</title>
+        <style>
+          body { background:#0a0a0a; color:#fff; font-family:system-ui,sans-serif; margin:0; padding:0; }
+          .container { max-width:600px; margin:40px auto; padding:20px; }
+          .header { background:#111; padding:20px; text-align:center; border-radius:8px 8px 0 0; }
+          .content { background:#1a1a1a; padding:30px; border-radius:0 0 8px 8px; }
+          h1 { color:#ef4444; margin:0 0 20px 0; }
+          .diff { font-size:26px; font-weight:bold; color:#f59e0b; }
+          .screenshots { display:flex; gap:20px; flex-wrap:wrap; margin:25px 0; }
+          .screenshot { max-width:100%; border:3px solid #333; border-radius:8px; }
+          .cta { display:inline-block; background:#ef4444; color:white; padding:16px 32px; text-decoration:none; border-radius:8px; font-weight:bold; font-size:16px; margin-top:20px; }
+          .cta:hover { background:#f87171; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header"><h1>🚨 YAYA Uptime Alert</h1></div>
+          <div class="content">
+            <p><strong>Store:</strong> <a href="${store.url}" style="color:#60a5fa;">${store.url}</a></p>
+            <p class="diff">Visual change detected: ${alert.diff_percentage}%</p>
+            
+            <div class="screenshots">
+              <div><p><strong>Before</strong></p><img src="${alert.before_url}" class="screenshot" alt="Before"></div>
+              <div><p><strong>After</strong></p><img src="${alert.after_url}" class="screenshot" alt="After"></div>
+            </div>
+
+            <a href="https://www.yayauptime.com/dashboard/alerts/${alert.id}" class="cta">VIEW IN DASHBOARD →</a>
+            
+            <p style="margin-top:30px; color:#666; font-size:13px;">YAYA Uptime • Visual Store Monitoring</p>
+          </div>
+        </div>
+      </body>
+      </html>`;
+
+    await resend.emails.send({
+      from: 'YAYA Uptime <alerts@yayauptime.com>',
+      to: user.email,
+      subject: `🚨 Visual change on ${store.url} – ${alert.diff_percentage}%`,
+      html,
+    });
+
+    log(`✅ Email alert sent to ${user.email} for ${store.url}`);
+  } catch (err) {
+    logError('Email send error: ' + err.message);
+  }
+}
+// ==================== END EMAIL FUNCTION ====================
+
 async function processStore(browser, store) {
   var id = store.id;
   var url = store.url;
@@ -184,15 +259,25 @@ async function processStore(browser, store) {
           }).eq('id', id);
           log('Dimension changed. Baseline updated silently.');
         } else if (diffResult.hasSignificantDiff) {
-          await supabase.from('alerts').insert({
-            store_id: id,
-            step: 'homepage',
-            before_url: baseline_homepage_url,
-            after_url: screenshotUrl,
-            diff_percentage: diffResult.diffPercentage,
-            type: diffResult.diffPercentage > 20 ? 'red' : 'yellow',
-          });
-          log('ALERT: ' + diffResult.diffPercentage + '% change detected!');
+          const { data: newAlert, error: alertError } = await supabase
+            .from('alerts')
+            .insert({
+              store_id: id,
+              step: 'homepage',
+              before_url: baseline_homepage_url,
+              after_url: screenshotUrl,
+              diff_percentage: diffResult.diffPercentage,
+              type: diffResult.diffPercentage > 20 ? 'red' : 'yellow',
+            })
+            .select()
+            .single();
+
+          if (alertError) {
+            logError('Failed to create alert: ' + alertError.message);
+          } else {
+            log('ALERT: ' + diffResult.diffPercentage + '% change detected!');
+            await sendAlertEmail(newAlert);  // ← Sends the email!
+          }
         } else {
           await supabase.from('stores').update({
             baseline_homepage_url: screenshotUrl,
@@ -225,7 +310,7 @@ async function processStore(browser, store) {
 }
 
 async function main() {
-  log('Starting bot worker...');
+  log('Starting bot worker with email alerts...');
 
   try {
     var result = await supabase
