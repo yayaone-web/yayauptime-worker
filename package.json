@@ -16,7 +16,8 @@
     "pixelmatch": "^7.1.0",
     "pngjs": "^7.0.0",
     "puppeteer": "^24.37.5",
-    "resend": "^6.9.2"
+    "resend": "^6.9.2",
+    "sharp": "^0.34.5"
   },
   "repository": {
     "type": "git",
