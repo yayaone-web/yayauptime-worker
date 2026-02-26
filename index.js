@@ -3,11 +3,13 @@
  * YAYA Uptime Worker
  * Periodically screenshots store homepages, compares against baseline,
  * creates alerts and sends emails on significant visual changes.
+ * Also runs basic ping monitoring every 5 minutes (free tier acquisition funnel).
  *
  * Features:
  * - Cron scheduling with overlap guard
  * - 5-second inter-store delay (Browserless rate-limit safety)
  * - Failed attempt tracking + auto-inactivation after 5 consecutive failures
+ * - Basic ping monitoring (up/down, response time, consecutive down alerts)
  * - Clean error handling & logging
  *
  * Last major update: February 26, 2026
@@ -25,7 +27,10 @@ const pixelmatch = require('pixelmatch').default || require('pixelmatch');
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
 const s3 = new S3Client({
   region: 'auto',
@@ -40,7 +45,12 @@ const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL || 'https://pub-9b659287417143e2
 const DIFF_THRESHOLD_PERCENT = parseFloat(process.env.DIFF_THRESHOLD_PERCENT || '5');
 const MAX_FAILURES_BEFORE_INACTIVE = 5;
 
-let isRunning = false;
+let isRunningVisual = false;
+let isRunningPing = false;
+
+// ────────────────────────────────────────────────
+// Logging Helpers
+// ────────────────────────────────────────────────
 
 function log(msg) {
   console.log(`[YAYA] ${msg}`);
@@ -49,6 +59,10 @@ function log(msg) {
 function logError(msg) {
   console.error(`[YAYA] ERROR: ${msg}`);
 }
+
+// ────────────────────────────────────────────────
+// Utility Functions
+// ────────────────────────────────────────────────
 
 function ensureHttps(url) {
   return url.startsWith('http') ? url : `https://${url}`;
@@ -69,12 +83,7 @@ async function uploadToR2(buffer, key) {
 async function downloadFromR2(key) {
   if (!key) return null;
   try {
-    const { Body } = await s3.send(
-      new GetObjectCommand({
-        Bucket: 'yaya-screenshots',
-        Key: key,
-      })
-    );
+    const { Body } = await s3.send(new GetObjectCommand({ Bucket: 'yaya-screenshots', Key: key }));
     const chunks = [];
     for await (const chunk of Body) chunks.push(Buffer.from(chunk));
     return Buffer.concat(chunks);
@@ -116,9 +125,7 @@ function compareImages(baselineBuffer, newBuffer) {
   }
 
   const diff = new Uint8Array(w1 * h1 * 4);
-  const numDiffPixels = pixelmatch(baselinePng.data, newPng.data, diff, w1, h1, {
-    threshold: 0.1,
-  });
+  const numDiffPixels = pixelmatch(baselinePng.data, newPng.data, diff, w1, h1, { threshold: 0.1 });
 
   const diffPercentage = (numDiffPixels / (w1 * h1)) * 100;
   return {
@@ -127,7 +134,11 @@ function compareImages(baselineBuffer, newBuffer) {
   };
 }
 
-async function sendAlertEmail(alert) {
+// ────────────────────────────────────────────────
+// Alert Email (visual + ping)
+// ────────────────────────────────────────────────
+
+async function sendAlertEmail(alert, type = 'visual') {
   try {
     const { data: store } = await supabase
       .from('stores')
@@ -140,7 +151,20 @@ async function sendAlertEmail(alert) {
     const { data: { user } } = await supabase.auth.admin.getUserById(store.user_id);
     if (!user?.email) return;
 
-    const html = `<!DOCTYPE html>
+    let subject, html;
+
+    if (type === 'ping') {
+      subject = `🚨 Your store is DOWN: ${store.url}`;
+      html = `
+        <h1 style="color:#ef4444;">Site Down Alert</h1>
+        <p>Your store <strong><a href="${store.url}">${store.url}</a></strong> has been unreachable for multiple checks.</p>
+        <p>Please check your hosting/server immediately.</p>
+        <p><a href="https://www.yayauptime.com/dashboard" style="display:inline-block; background:#ef4444; color:white; padding:16px 32px; text-decoration:none; border-radius:8px; font-weight:bold;">View in Dashboard</a></p>
+        <p style="color:#666; font-size:13px; margin-top:30px;">YAYA Uptime • Visual Store Monitoring</p>
+      `;
+    } else {
+      subject = `🚨 Visual change on ${store.url} – ${alert.diff_percentage}%`;
+      html = `<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
@@ -174,19 +198,88 @@ async function sendAlertEmail(alert) {
   </div>
 </body>
 </html>`;
+    }
 
     await resend.emails.send({
       from: 'YAYA Uptime <alerts@yayauptime.com>',
       to: user.email,
-      subject: `🚨 Visual change on ${store.url} – ${alert.diff_percentage}%`,
+      subject,
       html,
     });
 
-    log(`Alert email sent to ${user.email}`);
+    log(`Alert email sent to ${user.email} (${type})`);
   } catch (err) {
     logError(`Email send failed: ${err.message}`);
   }
 }
+
+// ────────────────────────────────────────────────
+// Ping Monitor (Mission 2.4.1)
+// ────────────────────────────────────────────────
+
+async function pingStore(store) {
+  const { id, url } = store;
+  const fullUrl = ensureHttps(url);
+  log(`Ping: ${id} - ${fullUrl}`);
+
+  const startTime = Date.now();
+  let statusCode = null;
+  let responseTimeMs = null;
+  let isUp = false;
+  let errorMsg = null;
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s timeout
+
+    const response = await fetch(fullUrl, {
+      method: 'HEAD',
+      signal: controller.signal,
+      redirect: 'follow',
+    });
+
+    clearTimeout(timeoutId);
+
+    statusCode = response.status;
+    responseTimeMs = Date.now() - startTime;
+    isUp = statusCode >= 200 && statusCode < 300;
+
+    log(`Ping ${fullUrl} – ${statusCode} (${responseTimeMs}ms)`);
+  } catch (err) {
+    responseTimeMs = Date.now() - startTime;
+    errorMsg = err.message || 'Unknown error';
+    isUp = false;
+
+    logError(`Ping failed ${fullUrl}: ${errorMsg}`);
+  }
+
+  // Insert ping log
+  await supabase.from('ping_logs').insert({
+    store_id: id,
+    status_code: statusCode,
+    response_time_ms: responseTimeMs,
+    is_up: isUp,
+    error_message: errorMsg,
+  });
+
+  // Check for consecutive downtime → send alert only on second failure
+  if (!isUp) {
+    const { data: lastPing } = await supabase
+      .from('ping_logs')
+      .select('is_up')
+      .eq('store_id', id)
+      .order('checked_at', { ascending: false })
+      .limit(1);
+
+    if (lastPing?.[0]?.is_up === false) {
+      await sendAlertEmail({ store_id: id }, 'ping');
+    }
+  }
+}
+
+// ────────────────────────────────────────────────
+// Core Visual Processing
+// ────────────────────────────────────────────────
 
 async function processStore(browser, store) {
   const { id, url, baseline_homepage_url } = store;
@@ -211,9 +304,7 @@ async function processStore(browser, store) {
     });
 
     await page.setViewport({ width: 1280, height: 800 });
-    await page.setUserAgent(
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 YAYAUptimeBot/1.0'
-    );
+    await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 YAYAUptimeBot/1.0');
 
     await page.goto(fullUrl, { waitUntil: 'networkidle2', timeout: 45000 });
     await new Promise((r) => setTimeout(r, 5000));
@@ -225,7 +316,6 @@ async function processStore(browser, store) {
     screenshotUrl = await uploadToR2(buffer, key);
     log(`Screenshot: ${key}`);
 
-    // Reset failure counter on successful screenshot
     await supabase.from('stores').update({ failed_attempts: 0 }).eq('id', id);
 
     if (!baseline_homepage_url) {
@@ -310,10 +400,7 @@ async function processStore(browser, store) {
   } finally {
     if (page) await page.close();
 
-    await supabase
-      .from('stores')
-      .update({ last_checked: new Date().toISOString() })
-      .eq('id', id);
+    await supabase.from('stores').update({ last_checked: new Date().toISOString() }).eq('id', id);
 
     await supabase.from('runs').insert({
       store_id: id,
@@ -327,14 +414,18 @@ async function processStore(browser, store) {
   }
 }
 
-async function runAllChecks() {
-  if (isRunning) {
-    log('Cycle still running — skipping');
+// ────────────────────────────────────────────────
+// Visual Cycle Runner
+// ────────────────────────────────────────────────
+
+async function runVisualChecks() {
+  if (isRunningVisual) {
+    log('Visual cycle still running — skipping');
     return;
   }
 
-  isRunning = true;
-  log('Starting check cycle');
+  isRunningVisual = true;
+  log('Starting visual check cycle');
 
   try {
     const { data: stores, error } = await supabase
@@ -344,11 +435,11 @@ async function runAllChecks() {
 
     if (error) throw error;
     if (!stores?.length) {
-      log('No active stores');
+      log('No active stores for visual check');
       return;
     }
 
-    log(`Processing ${stores.length} stores`);
+    log(`Processing ${stores.length} stores (visual)`);
 
     const browser = await puppeteer.connect({
       browserWSEndpoint: `wss://chrome.browserless.io?token=${process.env.BROWSERLESS_API_KEY}`,
@@ -361,22 +452,71 @@ async function runAllChecks() {
     }
 
     await browser.close();
-    log('Cycle finished');
+    log('Visual cycle finished');
   } catch (err) {
-    logError(`Cycle error: ${err.message}`);
+    logError(`Visual cycle error: ${err.message}`);
   } finally {
-    isRunning = false;
+    isRunningVisual = false;
   }
 }
 
 // ────────────────────────────────────────────────
-// Start scheduler
+// Ping Cycle Runner (Mission 2.4.1)
 // ────────────────────────────────────────────────
 
-cron.schedule('*/5 * * * *', runAllChecks);
+async function runPingChecks() {
+  if (isRunningPing) {
+    log('Ping cycle still running — skipping');
+    return;
+  }
+
+  isRunningPing = true;
+  log('Starting ping cycle');
+
+  try {
+    const { data: stores, error } = await supabase
+      .from('stores')
+      .select('id, url')
+      .eq('status', 'active');
+
+    if (error) throw error;
+    if (!stores?.length) {
+      log('No active stores for ping');
+      return;
+    }
+
+    log(`Pinging ${stores.length} stores`);
+
+    for (const store of stores) {
+      await pingStore(store);
+    }
+
+    log('Ping cycle finished');
+  } catch (err) {
+    logError(`Ping cycle error: ${err.message}`);
+  } finally {
+    isRunningPing = false;
+  }
+}
+
+// ────────────────────────────────────────────────
+// Scheduler
+// ────────────────────────────────────────────────
+
+// Visual checks every 15 minutes (Mission 2.4 aligned)
+cron.schedule('*/15 * * * *', runVisualChecks);
+
+// Ping checks every 5 minutes (Mission 2.4.1)
+cron.schedule('*/5 * * * *', runPingChecks);
+
+// Immediate first visual run
+runVisualChecks();
+
+// Immediate first ping run (for faster testing)
+runPingChecks();
 
 log('Worker started');
-log('Checks every 5 minutes');
+log('Visual checks every 15 minutes (first run immediate) | Ping checks every 5 minutes (first run immediate)');
 
 process.on('SIGTERM', () => {
   log('SIGTERM received — shutting down');
