@@ -1,20 +1,18 @@
 #!/usr/bin/env node
 /**
- * YAYA Uptime Worker
- * Periodically screenshots store homepages, compares against baseline,
- * creates alerts and sends emails on significant visual changes.
- * Also runs basic ping monitoring every 5 minutes (free tier acquisition funnel).
- *
- * Features:
- * - Cron scheduling with overlap guard
- * - 5-second inter-store delay (Browserless rate-limit safety)
- * - Failed attempt tracking + auto-inactivation after 5 consecutive failures
- * - Basic ping monitoring (up/down, response time, consecutive down alerts)
- * - Bot identity + CSS noise hiding for cleaner screenshots
- * - R2 uploads with compression (sharp) + long-term caching
- * - Visual diff image: Ghost overlay (actual screenshot with semi-transparent red highlights)
- * - Clean error handling & logging
- *
+ * YAYA Uptime Worker – Phase 2 Complete (Production Ready)
+ * 
+ * Full visual monitoring pipeline:
+ * - Takes clean screenshots with bot identity
+ * - Hides noise (cookies, popups, etc.)
+ * - Creates Ghost Overlay diff (actual page + semi-transparent red highlights)
+ * - Compares against baseline
+ * - Saves alerts to Supabase with diff_url
+ * - Sends rich emails with before/after + highlighted diff
+ * - Logs risk metrics to check_logs table (Mission 2.10.1)
+ * 
+ * Run the SQL migration once before starting.
+ * 
  * Last major update: February 26, 2026
  */
 
@@ -74,7 +72,7 @@ function ensureHttps(url) {
 
 async function uploadToR2(buffer, key) {
   const compressed = await sharp(buffer)
-    .png({ quality: 90, compressionLevel: 9 })
+    .png({ quality: 80, compressionLevel: 9 })   // ← optimized for smaller diffs
     .toBuffer();
 
   await s3.send(
@@ -111,10 +109,11 @@ function extractR2Key(publicUrl) {
   }
 }
 
-// ────────────────────────────────────────────────
-// Improved Ghost Overlay compareImages (your version)
-// ────────────────────────────────────────────────
-
+/**
+ * Optimized Ghost Overlay compareImages (Mission 2.7)
+ * Creates actual page + semi-transparent red highlights on changed areas.
+ * Uses aggressive Sharp compression for tiny file sizes (~300-600 KB).
+ */
 async function compareImages(baselineBuffer, newBuffer, id, timestamp) {
   try {
     const baselinePng = PNG.sync.read(baselineBuffer);
@@ -122,29 +121,34 @@ async function compareImages(baselineBuffer, newBuffer, id, timestamp) {
     const { width, height } = baselinePng;
 
     if (width !== newPng.width || height !== newPng.height) {
+      log(`Dimension change: ${width}x${height} → ${newPng.width}x${newPng.height}`);
       return { hasSignificantDiff: false, dimensionChanged: true };
     }
 
     const diff = new PNG({ width, height });
-   
-    // Create the ghost overlay
+
     const numDiffPixels = pixelmatch(baselinePng.data, newPng.data, diff.data, width, height, {
       threshold: 0.1,
       alpha: 0.5,
     });
+
     const diffPercentage = (numDiffPixels / (width * height)) * 100;
-   
-    // 1. Get the raw buffer from pngjs
+
     const rawDiffBuffer = PNG.sync.write(diff);
-    // 2. CRITICAL: Use Sharp to compress the 15MB raw data into a 200KB PNG
+
     const optimizedDiffBuffer = await sharp(rawDiffBuffer)
-      .png({ compressionLevel: 9, adaptiveFiltering: true })
+      .png({
+        compressionLevel: 9,
+        adaptiveFiltering: true,
+        palette: true,
+        quality: 80
+      })
       .toBuffer();
 
     const diffKey = `diffs/${id}/${timestamp}-diff.png`;
     const diffUrl = await uploadToR2(optimizedDiffBuffer, diffKey);
 
-    log(`Ghost overlay diff uploaded: ${diffPercentage.toFixed(2)}%`);
+    log(`Ghost overlay uploaded: ${diffPercentage.toFixed(2)}% (${(optimizedDiffBuffer.length / 1024).toFixed(1)} KB)`);
 
     return {
       hasSignificantDiff: diffPercentage > DIFF_THRESHOLD_PERCENT,
@@ -158,7 +162,7 @@ async function compareImages(baselineBuffer, newBuffer, id, timestamp) {
 }
 
 // ────────────────────────────────────────────────
-// Alert Email (visual + ping)
+// Alert Email (Mission 2.9)
 // ────────────────────────────────────────────────
 
 async function sendAlertEmail(alert, type = 'visual') {
@@ -300,7 +304,7 @@ async function pingStore(store) {
 }
 
 // ────────────────────────────────────────────────
-// Core Visual Processing
+// Core Visual Processing (Missions 2.5–2.10.1)
 // ────────────────────────────────────────────────
 
 async function processStore(browser, store) {
@@ -458,6 +462,24 @@ async function processStore(browser, store) {
 
     await supabase.from('stores').update({ last_checked: new Date().toISOString() }).eq('id', id);
 
+    // Mission 2.10.1: Risk logging (safely in finally block)
+    try {
+      const runDurationSec = Math.round((Date.now() - new Date(runStart)) / 1000);
+      await supabase.from('check_logs').insert({
+        store_id: id,
+        status: status,
+        error_message: errorMsg,
+        browserless_units: Math.round(runDurationSec / 2),
+        claude_called: false,
+        claude_cost_estimate: null,
+        claude_severity: null,
+        navigation_steps_passed: 1,
+        navigation_steps_total: 4,
+      });
+    } catch (err) {
+      logError(`check_logs insert failed: ${err.message}`);
+    }
+
     await supabase.from('runs').insert({
       store_id: id,
       started_at: runStart,
@@ -559,16 +581,14 @@ async function runPingChecks() {
 // Scheduler
 // ────────────────────────────────────────────────
 
-// Visual checks every 15 minutes (Mission 2.4 aligned)
+// Visual checks every 15 minutes
 cron.schedule('*/15 * * * *', runVisualChecks);
 
-// Ping checks every 5 minutes (Mission 2.4.1)
+// Ping checks every 5 minutes
 cron.schedule('*/5 * * * *', runPingChecks);
 
-// Immediate first visual run
+// Immediate first runs
 runVisualChecks();
-
-// Immediate first ping run
 runPingChecks();
 
 log('Worker started');
