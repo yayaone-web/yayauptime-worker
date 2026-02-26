@@ -10,6 +10,9 @@
  * - 5-second inter-store delay (Browserless rate-limit safety)
  * - Failed attempt tracking + auto-inactivation after 5 consecutive failures
  * - Basic ping monitoring (up/down, response time, consecutive down alerts)
+ * - Bot identity + CSS noise hiding for cleaner screenshots
+ * - R2 uploads with long-term caching
+ * - Visual diff image upload for debugging
  * - Clean error handling & logging
  *
  * Last major update: February 26, 2026
@@ -42,7 +45,7 @@ const s3 = new S3Client({
 });
 
 const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL || 'https://pub-9b659287417143e2a5f69b43384c4039.r2.dev';
-const DIFF_THRESHOLD_PERCENT = parseFloat(process.env.DIFF_THRESHOLD_PERCENT || '5');
+const DIFF_THRESHOLD_PERCENT = 2; // temporary for debugging (change back to 5 later)
 const MAX_FAILURES_BEFORE_INACTIVE = 5;
 
 let isRunningVisual = false;
@@ -75,6 +78,7 @@ async function uploadToR2(buffer, key) {
       Key: key,
       Body: buffer,
       ContentType: 'image/png',
+      CacheControl: 'public, max-age=31536000', // 1 year cache
     })
   );
   return `${R2_PUBLIC_URL}/${key}`;
@@ -102,7 +106,7 @@ function extractR2Key(publicUrl) {
   }
 }
 
-function compareImages(baselineBuffer, newBuffer) {
+function compareImages(baselineBuffer, newBuffer, id, timestamp) {
   if (!baselineBuffer || !newBuffer) {
     return { hasSignificantDiff: true, diffPercentage: 100 };
   }
@@ -128,6 +132,13 @@ function compareImages(baselineBuffer, newBuffer) {
   const numDiffPixels = pixelmatch(baselinePng.data, newPng.data, diff, w1, h1, { threshold: 0.1 });
 
   const diffPercentage = (numDiffPixels / (w1 * h1)) * 100;
+
+  // Upload diff image for debugging (red pixels show differences)
+  const diffKey = `diffs/${id}/${timestamp}-diff.png`;
+  const diffBuffer = Buffer.from(diff);
+  uploadToR2(diffBuffer, diffKey).catch(err => logError(`Diff upload failed: ${err.message}`));
+  log(`Diff image uploaded: ${diffKey}`);
+
   return {
     hasSignificantDiff: diffPercentage > DIFF_THRESHOLD_PERCENT,
     diffPercentage: Math.round(diffPercentage * 100) / 100,
@@ -230,7 +241,7 @@ async function pingStore(store) {
 
   try {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s timeout
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
 
     const response = await fetch(fullUrl, {
       method: 'HEAD',
@@ -253,7 +264,6 @@ async function pingStore(store) {
     logError(`Ping failed ${fullUrl}: ${errorMsg}`);
   }
 
-  // Insert ping log
   await supabase.from('ping_logs').insert({
     store_id: id,
     status_code: statusCode,
@@ -262,7 +272,6 @@ async function pingStore(store) {
     error_message: errorMsg,
   });
 
-  // Check for consecutive downtime → send alert only on second failure
   if (!isUp) {
     const { data: lastPing } = await supabase
       .from('ping_logs')
@@ -278,7 +287,7 @@ async function pingStore(store) {
 }
 
 // ────────────────────────────────────────────────
-// Core Visual Processing
+// Core Visual Processing (Mission 2.5 fully patched)
 // ────────────────────────────────────────────────
 
 async function processStore(browser, store) {
@@ -296,6 +305,42 @@ async function processStore(browser, store) {
   try {
     page = await browser.newPage();
 
+    // Mission 2.5: Bot identity
+    await page.setExtraHTTPHeaders({
+      'X-YAYA-Uptime': 'true',
+      'X-Purpose': 'Uptime Monitoring with consent',
+    });
+
+    await page.setUserAgent(
+      'Mozilla/5.0 (compatible; YAYA Uptime Bot/1.0; +https://yayauptime.com/bot)'
+    );
+
+    // Mission 2.5: Hide common noise elements (expanded selector set)
+    await page.addStyleTag({
+      content: `
+        [id*="cookie"], [class*="cookie"], [class*="gdpr"], [class*="consent"],
+        [class*="banner"], [class*="popup"], [class*="modal"], [class*="overlay"],
+        [class*="chat"], [id*="chat"], [id*="intercom"], [class*="widget"],
+        .cookie-notice, .cookie-consent, .cookie-law, .cookie-message,
+        .cc-window, .cc-banner, .cc-compliance, .cc-floating, .cc-revoke,
+        iframe[src*="cookie"], iframe[src*="consent"], [data-cookie],
+        [data-gdpr], [data-consent], [data-tracking], [data-analytics],
+        .popup-wrapper, .popup-container, .modal-backdrop, .backdrop,
+        .notification-bar, .alert-bar, .top-bar, .bottom-bar,
+        .newsletter-popup, .exit-intent, .scroll-popup, .float-chat {
+          display: none !important;
+          visibility: hidden !important;
+          opacity: 0 !important;
+          pointer-events: none !important;
+          height: 0 !important;
+          width: 0 !important;
+          max-height: 0 !important;
+          max-width: 0 !important;
+          overflow: hidden !important;
+        }
+      `,
+    });
+
     await page.setRequestInterception(true);
     page.on('request', (req) => {
       const type = req.resourceType();
@@ -304,14 +349,13 @@ async function processStore(browser, store) {
     });
 
     await page.setViewport({ width: 1280, height: 800 });
-    await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 YAYAUptimeBot/1.0');
 
     await page.goto(fullUrl, { waitUntil: 'networkidle2', timeout: 45000 });
     await new Promise((r) => setTimeout(r, 5000));
 
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const key = `screenshots/${id}/homepage-${timestamp}.png`;
-    const buffer = await page.screenshot({ fullPage: false, type: 'png' });
+    const buffer = await page.screenshot({ fullPage: true, type: 'png' });
 
     screenshotUrl = await uploadToR2(buffer, key);
     log(`Screenshot: ${key}`);
@@ -333,7 +377,7 @@ async function processStore(browser, store) {
       return;
     }
 
-    diffResult = compareImages(baselineBuffer, buffer);
+    diffResult = compareImages(baselineBuffer, buffer, id, timestamp);
 
     if (diffResult.dimensionChanged) {
       await supabase.from('stores').update({ baseline_homepage_url: screenshotUrl }).eq('id', id);
@@ -512,7 +556,7 @@ cron.schedule('*/5 * * * *', runPingChecks);
 // Immediate first visual run
 runVisualChecks();
 
-// Immediate first ping run (for faster testing)
+// Immediate first ping run
 runPingChecks();
 
 log('Worker started');
