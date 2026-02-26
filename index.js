@@ -6,14 +6,15 @@
  * Also runs basic ping monitoring every 5 minutes (free tier acquisition funnel).
  *
  * Features:
- * - Cron scheduling with overlap guard
- * - 5-second inter-store delay (Browserless rate-limit safety)
+ * - Cron scheduling with overlap guard (prevents overlapping runs)
+ * - 5-second delay between stores (protects Browserless rate limits)
  * - Failed attempt tracking + auto-inactivation after 5 consecutive failures
- * - Basic ping monitoring (up/down, response time, consecutive down alerts)
- * - Bot identity + CSS noise hiding for cleaner screenshots
- * - R2 uploads with long-term caching
- * - Visual diff image upload for debugging
- * - Clean error handling & logging
+ * - Basic ping monitoring (up/down status, response time, alerts on consecutive downtime)
+ * - Bot identity headers + User-Agent to avoid blocking
+ * - CSS injection to hide noise (cookie banners, popups, chat widgets, etc.)
+ * - R2 uploads with long-term caching (1-year cache)
+ * - Visual diff image upload for debugging (shows red pixels where changes occur)
+ * - Clean, readable code with detailed comments for future maintenance
  *
  * Last major update: February 26, 2026
  */
@@ -45,7 +46,7 @@ const s3 = new S3Client({
 });
 
 const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL || 'https://pub-9b659287417143e2a5f69b43384c4039.r2.dev';
-const DIFF_THRESHOLD_PERCENT = 2; // temporary for debugging (change back to 5 later)
+const DIFF_THRESHOLD_PERCENT = 2; // temporary for debugging (increase back to 5 once tuned)
 const MAX_FAILURES_BEFORE_INACTIVE = 5;
 
 let isRunningVisual = false;
@@ -78,7 +79,7 @@ async function uploadToR2(buffer, key) {
       Key: key,
       Body: buffer,
       ContentType: 'image/png',
-      CacheControl: 'public, max-age=31536000', // 1 year cache
+      CacheControl: 'public, max-age=31536000', // 1-year cache for fast loading
     })
   );
   return `${R2_PUBLIC_URL}/${key}`;
@@ -106,6 +107,15 @@ function extractR2Key(publicUrl) {
   }
 }
 
+/**
+ * Compares two PNG buffers pixel-by-pixel using pixelmatch.
+ * Returns difference percentage and uploads a visual diff image for debugging.
+ * @param {Buffer} baselineBuffer - Baseline image buffer
+ * @param {Buffer} newBuffer - New screenshot buffer
+ * @param {string} id - Store ID (for diff file naming)
+ * @param {string} timestamp - Timestamp for unique diff filename
+ * @returns {Object} { hasSignificantDiff, diffPercentage, dimensionChanged? }
+ */
 function compareImages(baselineBuffer, newBuffer, id, timestamp) {
   if (!baselineBuffer || !newBuffer) {
     return { hasSignificantDiff: true, diffPercentage: 100 };
@@ -129,11 +139,14 @@ function compareImages(baselineBuffer, newBuffer, id, timestamp) {
   }
 
   const diff = new Uint8Array(w1 * h1 * 4);
-  const numDiffPixels = pixelmatch(baselinePng.data, newPng.data, diff, w1, h1, { threshold: 0.1 });
+  const numDiffPixels = pixelmatch(baselinePng.data, newPng.data, diff, w1, h1, {
+    threshold: 0.1,
+    ignoreColor: true, // ignore minor color shifts (reduces false positives from anti-aliasing)
+  });
 
   const diffPercentage = (numDiffPixels / (w1 * h1)) * 100;
 
-  // Upload diff image for debugging (red pixels show differences)
+  // Upload diff image for debugging (red pixels show where differences were detected)
   const diffKey = `diffs/${id}/${timestamp}-diff.png`;
   const diffBuffer = Buffer.from(diff);
   uploadToR2(diffBuffer, diffKey).catch(err => logError(`Diff upload failed: ${err.message}`));
@@ -305,7 +318,7 @@ async function processStore(browser, store) {
   try {
     page = await browser.newPage();
 
-    // Mission 2.5: Bot identity
+    // Mission 2.5: Bot identity (helps avoid blocking)
     await page.setExtraHTTPHeaders({
       'X-YAYA-Uptime': 'true',
       'X-Purpose': 'Uptime Monitoring with consent',
