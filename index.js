@@ -1,28 +1,35 @@
 #!/usr/bin/env node
 /**
- * YAYA Uptime — Bot Worker (MVP v2 + Day 4 Email Alerts)
- * Monitors store homepages: screenshot, compare to baseline, alert + EMAIL on changes.
- * Updated February 25, 2026
+ * YAYA Uptime Worker
+ * Periodically screenshots store homepages, compares against baseline,
+ * creates alerts and sends emails on significant visual changes.
+ *
+ * Features:
+ * - Cron scheduling with overlap guard
+ * - 5-second inter-store delay (Browserless rate-limit safety)
+ * - Failed attempt tracking + auto-inactivation after 5 consecutive failures
+ * - Clean error handling & logging
+ *
+ * Last major update: February 26, 2026
  */
 
 require('dotenv').config();
+
+const cron = require('node-cron');
 const { createClient } = require('@supabase/supabase-js');
 const puppeteer = require('puppeteer');
 const { S3Client, GetObjectCommand, PutObjectCommand } = require('@aws-sdk/client-s3');
 const { PNG } = require('pngjs');
 const { Resend } = require('resend');
-
-const pixelmatchModule = require('pixelmatch');
-const pixelmatch = pixelmatchModule.default || pixelmatchModule;
+const pixelmatch = require('pixelmatch').default || require('pixelmatch');
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 
-// Service role key (required for fetching user emails)
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
 const s3 = new S3Client({
   region: 'auto',
-  endpoint: 'https://' + process.env.CLOUDFLARE_ACCOUNT_ID + '.r2.cloudflarestorage.com',
+  endpoint: `https://${process.env.CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com`,
   credentials: {
     accessKeyId: process.env.CLOUDFLARE_ACCESS_KEY_ID,
     secretAccessKey: process.env.CLOUDFLARE_SECRET_ACCESS_KEY,
@@ -31,46 +38,48 @@ const s3 = new S3Client({
 
 const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL || 'https://pub-9b659287417143e2a5f69b43384c4039.r2.dev';
 const DIFF_THRESHOLD_PERCENT = parseFloat(process.env.DIFF_THRESHOLD_PERCENT || '5');
+const MAX_FAILURES_BEFORE_INACTIVE = 5;
+
+let isRunning = false;
 
 function log(msg) {
-  console.log('[YAYA Uptime] ' + msg);
+  console.log(`[YAYA] ${msg}`);
 }
 
 function logError(msg) {
-  console.error('[YAYA Uptime] ' + msg);
+  console.error(`[YAYA] ERROR: ${msg}`);
 }
 
 function ensureHttps(url) {
-  if (!url.startsWith('http://') && !url.startsWith('https://')) {
-    return 'https://' + url;
-  }
-  return url;
+  return url.startsWith('http') ? url : `https://${url}`;
 }
 
 async function uploadToR2(buffer, key) {
-  await s3.send(new PutObjectCommand({
-    Bucket: 'yaya-screenshots',
-    Key: key,
-    Body: buffer,
-    ContentType: 'image/png',
-  }));
-  return R2_PUBLIC_URL + '/' + key;
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: 'yaya-screenshots',
+      Key: key,
+      Body: buffer,
+      ContentType: 'image/png',
+    })
+  );
+  return `${R2_PUBLIC_URL}/${key}`;
 }
 
 async function downloadFromR2(key) {
   if (!key) return null;
   try {
-    const response = await s3.send(new GetObjectCommand({
-      Bucket: 'yaya-screenshots',
-      Key: key,
-    }));
+    const { Body } = await s3.send(
+      new GetObjectCommand({
+        Bucket: 'yaya-screenshots',
+        Key: key,
+      })
+    );
     const chunks = [];
-    for await (const chunk of response.Body) {
-      chunks.push(Buffer.from(chunk));
-    }
+    for await (const chunk of Body) chunks.push(Buffer.from(chunk));
     return Buffer.concat(chunks);
   } catch (err) {
-    logError('R2 download failed for ' + key + ': ' + err.message);
+    logError(`R2 download failed for ${key}: ${err.message}`);
     return null;
   }
 }
@@ -78,9 +87,8 @@ async function downloadFromR2(key) {
 function extractR2Key(publicUrl) {
   if (!publicUrl) return null;
   try {
-    const url = new URL(publicUrl);
-    return url.pathname.substring(1);
-  } catch (e) {
+    return new URL(publicUrl).pathname.substring(1);
+  } catch {
     return null;
   }
 }
@@ -90,41 +98,35 @@ function compareImages(baselineBuffer, newBuffer) {
     return { hasSignificantDiff: true, diffPercentage: 100 };
   }
 
-  var baselinePng, newPng;
+  let baselinePng, newPng;
   try {
     baselinePng = PNG.sync.read(baselineBuffer);
     newPng = PNG.sync.read(newBuffer);
   } catch (err) {
-    logError('PNG decode failed: ' + err.message);
+    logError(`PNG decode failed: ${err.message}`);
     return { hasSignificantDiff: true, diffPercentage: 100 };
   }
 
-  var w1 = baselinePng.width, h1 = baselinePng.height;
-  var w2 = newPng.width, h2 = newPng.height;
+  const { width: w1, height: h1 } = baselinePng;
+  const { width: w2, height: h2 } = newPng;
 
   if (w1 !== w2 || h1 !== h2) {
-    log('Dimension change: ' + w1 + 'x' + h1 + ' -> ' + w2 + 'x' + h2);
+    log(`Dimension change: ${w1}x${h1} → ${w2}x${h2}`);
     return { hasSignificantDiff: false, diffPercentage: 0, dimensionChanged: true };
   }
 
-  var diff = new Uint8Array(w1 * h1 * 4);
-  var numDiffPixels = pixelmatch(
-    baselinePng.data,
-    newPng.data,
-    diff,
-    w1,
-    h1,
-    { threshold: 0.1 }
-  );
+  const diff = new Uint8Array(w1 * h1 * 4);
+  const numDiffPixels = pixelmatch(baselinePng.data, newPng.data, diff, w1, h1, {
+    threshold: 0.1,
+  });
 
-  var diffPercentage = (numDiffPixels / (w1 * h1)) * 100;
+  const diffPercentage = (numDiffPixels / (w1 * h1)) * 100;
   return {
     hasSignificantDiff: diffPercentage > DIFF_THRESHOLD_PERCENT,
     diffPercentage: Math.round(diffPercentage * 100) / 100,
   };
 }
 
-// ==================== DAY 4: EMAIL ALERT FUNCTION ====================
 async function sendAlertEmail(alert) {
   try {
     const { data: store } = await supabase
@@ -133,52 +135,45 @@ async function sendAlertEmail(alert) {
       .eq('id', alert.store_id)
       .single();
 
-    if (!store || !store.user_id) return;
+    if (!store?.user_id) return;
 
     const { data: { user } } = await supabase.auth.admin.getUserById(store.user_id);
-    if (!user?.email) {
-      logError('No email found for user ' + store.user_id);
-      return;
-    }
+    if (!user?.email) return;
 
-    const html = `
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <meta charset="utf-8">
-        <title>YAYA Uptime Alert</title>
-        <style>
-          body { background:#0a0a0a; color:#fff; font-family:system-ui,sans-serif; margin:0; padding:0; }
-          .container { max-width:600px; margin:40px auto; padding:20px; }
-          .header { background:#111; padding:20px; text-align:center; border-radius:8px 8px 0 0; }
-          .content { background:#1a1a1a; padding:30px; border-radius:0 0 8px 8px; }
-          h1 { color:#ef4444; margin:0 0 20px 0; }
-          .diff { font-size:26px; font-weight:bold; color:#f59e0b; }
-          .screenshots { display:flex; gap:20px; flex-wrap:wrap; margin:25px 0; }
-          .screenshot { max-width:100%; border:3px solid #333; border-radius:8px; }
-          .cta { display:inline-block; background:#ef4444; color:white; padding:16px 32px; text-decoration:none; border-radius:8px; font-weight:bold; font-size:16px; margin-top:20px; }
-          .cta:hover { background:#f87171; }
-        </style>
-      </head>
-      <body>
-        <div class="container">
-          <div class="header"><h1>🚨 YAYA Uptime Alert</h1></div>
-          <div class="content">
-            <p><strong>Store:</strong> <a href="${store.url}" style="color:#60a5fa;">${store.url}</a></p>
-            <p class="diff">Visual change detected: ${alert.diff_percentage}%</p>
-            
-            <div class="screenshots">
-              <div><p><strong>Before</strong></p><img src="${alert.before_url}" class="screenshot" alt="Before"></div>
-              <div><p><strong>After</strong></p><img src="${alert.after_url}" class="screenshot" alt="After"></div>
-            </div>
-
-            <a href="https://www.yayauptime.com/dashboard/alerts/${alert.id}" class="cta">VIEW IN DASHBOARD →</a>
-            
-            <p style="margin-top:30px; color:#666; font-size:13px;">YAYA Uptime • Visual Store Monitoring</p>
-          </div>
-        </div>
-      </body>
-      </html>`;
+    const html = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>YAYA Uptime Alert</title>
+  <style>
+    body { background:#0a0a0a; color:#fff; font-family:system-ui,sans-serif; margin:0; padding:0; }
+    .container { max-width:600px; margin:40px auto; padding:20px; }
+    .header { background:#111; padding:20px; text-align:center; border-radius:8px 8px 0 0; }
+    .content { background:#1a1a1a; padding:30px; border-radius:0 0 8px 8px; }
+    h1 { color:#ef4444; margin:0 0 20px; }
+    .diff { font-size:26px; font-weight:bold; color:#f59e0b; }
+    .screenshots { display:flex; gap:20px; flex-wrap:wrap; margin:25px 0; }
+    .screenshot { max-width:100%; border:3px solid #333; border-radius:8px; }
+    .cta { display:inline-block; background:#ef4444; color:white; padding:16px 32px; text-decoration:none; border-radius:8px; font-weight:bold; font-size:16px; margin-top:20px; }
+    .cta:hover { background:#f87171; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header"><h1>🚨 YAYA Uptime Alert</h1></div>
+    <div class="content">
+      <p><strong>Store:</strong> <a href="${store.url}" style="color:#60a5fa;">${store.url}</a></p>
+      <p class="diff">Visual change detected: ${alert.diff_percentage}%</p>
+      <div class="screenshots">
+        <div><p><strong>Before</strong></p><img src="${alert.before_url}" class="screenshot" alt="Before"></div>
+        <div><p><strong>After</strong></p><img src="${alert.after_url}" class="screenshot" alt="After"></div>
+      </div>
+      <a href="https://www.yayauptime.com/dashboard/alerts/${alert.id}" class="cta">VIEW IN DASHBOARD →</a>
+      <p style="margin-top:30px; color:#666; font-size:13px;">YAYA Uptime • Visual Store Monitoring</p>
+    </div>
+  </div>
+</body>
+</html>`;
 
     await resend.emails.send({
       from: 'YAYA Uptime <alerts@yayauptime.com>',
@@ -187,163 +182,203 @@ async function sendAlertEmail(alert) {
       html,
     });
 
-    log(`✅ Email alert sent to ${user.email} for ${store.url}`);
+    log(`Alert email sent to ${user.email}`);
   } catch (err) {
-    logError('Email send error: ' + err.message);
+    logError(`Email send failed: ${err.message}`);
   }
 }
-// ==================== END EMAIL FUNCTION ====================
 
 async function processStore(browser, store) {
-  var id = store.id;
-  var url = store.url;
-  var baseline_homepage_url = store.baseline_homepage_url;
-  var fullUrl = ensureHttps(url);
-  log('Processing: ' + fullUrl);
+  const { id, url, baseline_homepage_url } = store;
+  const fullUrl = ensureHttps(url);
+  log(`Processing ${id}: ${fullUrl}`);
 
-  var runStart = new Date().toISOString();
-  var runStatus = 'success';
-  var runError = null;
-  var screenshotUrl = null;
-  var diffResult = null;
-
-  var page = await browser.newPage();
+  const runStart = new Date().toISOString();
+  let status = 'success';
+  let errorMsg = null;
+  let screenshotUrl = null;
+  let diffResult = null;
+  let page = null;
 
   try {
+    page = await browser.newPage();
+
     await page.setRequestInterception(true);
-    page.on('request', function(req) {
-      var type = req.resourceType();
-      if (type === 'font' || type === 'media') {
-        req.abort();
-      } else {
-        req.continue();
-      }
+    page.on('request', (req) => {
+      const type = req.resourceType();
+      if (type === 'font' || type === 'media') req.abort();
+      else req.continue();
     });
 
     await page.setViewport({ width: 1280, height: 800 });
     await page.setUserAgent(
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 YAYAUptimeBot/1.0'
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 YAYAUptimeBot/1.0'
     );
 
     await page.goto(fullUrl, { waitUntil: 'networkidle2', timeout: 45000 });
+    await new Promise((r) => setTimeout(r, 5000));
 
-    await new Promise(function(r) { setTimeout(r, 5000); });
-
-    var timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    var key = 'screenshots/' + id + '/homepage-' + timestamp + '.png';
-    var buffer = await page.screenshot({ fullPage: false, type: 'png' });
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const key = `screenshots/${id}/homepage-${timestamp}.png`;
+    const buffer = await page.screenshot({ fullPage: false, type: 'png' });
 
     screenshotUrl = await uploadToR2(buffer, key);
-    log('Screenshot uploaded: ' + key);
+    log(`Screenshot: ${key}`);
+
+    // Reset failure counter on successful screenshot
+    await supabase.from('stores').update({ failed_attempts: 0 }).eq('id', id);
 
     if (!baseline_homepage_url) {
-      await supabase.from('stores').update({
-        baseline_homepage_url: screenshotUrl,
-      }).eq('id', id);
-      log('First run. Baseline set.');
-    } else {
-      var baselineKey = extractR2Key(baseline_homepage_url);
-      var baselineBuffer = await downloadFromR2(baselineKey);
-
-      if (!baselineBuffer) {
-        await supabase.from('stores').update({
-          baseline_homepage_url: screenshotUrl,
-        }).eq('id', id);
-        log('Baseline file missing. Reset to current screenshot.');
-      } else {
-        diffResult = compareImages(baselineBuffer, buffer);
-
-        if (diffResult.dimensionChanged) {
-          await supabase.from('stores').update({
-            baseline_homepage_url: screenshotUrl,
-          }).eq('id', id);
-          log('Dimension changed. Baseline updated silently.');
-        } else if (diffResult.hasSignificantDiff) {
-          const { data: newAlert, error: alertError } = await supabase
-            .from('alerts')
-            .insert({
-              store_id: id,
-              step: 'homepage',
-              before_url: baseline_homepage_url,
-              after_url: screenshotUrl,
-              diff_percentage: diffResult.diffPercentage,
-              type: diffResult.diffPercentage > 20 ? 'red' : 'yellow',
-            })
-            .select()
-            .single();
-
-          if (alertError) {
-            logError('Failed to create alert: ' + alertError.message);
-          } else {
-            log('ALERT: ' + diffResult.diffPercentage + '% change detected!');
-            await sendAlertEmail(newAlert);  // ← Sends the email!
-          }
-        } else {
-          await supabase.from('stores').update({
-            baseline_homepage_url: screenshotUrl,
-          }).eq('id', id);
-          log('OK: ' + diffResult.diffPercentage + '% change (below threshold).');
-        }
-      }
-    }
-  } catch (err) {
-    runStatus = 'error';
-    runError = err.message;
-    logError('Store ' + id + ' failed: ' + err.message);
-  } finally {
-    await page.close();
-  }
-
-  await supabase.from('stores').update({
-    last_checked: new Date().toISOString(),
-  }).eq('id', id);
-
-  await supabase.from('runs').insert({
-    store_id: id,
-    started_at: runStart,
-    finished_at: new Date().toISOString(),
-    status: runStatus,
-    error_message: runError,
-    screenshot_url: screenshotUrl,
-    diff_percentage: diffResult ? diffResult.diffPercentage : null,
-  });
-}
-
-async function main() {
-  log('Starting bot worker with email alerts...');
-
-  try {
-    var result = await supabase
-      .from('stores')
-      .select('id, url, baseline_homepage_url')
-      .eq('status', 'active');
-
-    if (result.error) throw result.error;
-
-    var stores = result.data;
-
-    if (!stores || stores.length === 0) {
-      log('No active stores found.');
+      await supabase.from('stores').update({ baseline_homepage_url: screenshotUrl }).eq('id', id);
+      log('First run — baseline set');
       return;
     }
 
-    log('Found ' + stores.length + ' active store(s).');
+    const baselineKey = extractR2Key(baseline_homepage_url);
+    const baselineBuffer = await downloadFromR2(baselineKey);
 
-    var browser = await puppeteer.connect({
-      browserWSEndpoint: 'wss://chrome.browserless.io?token=' + process.env.BROWSERLESS_API_KEY,
-      ignoreHTTPSErrors: true,
-    });
-
-    for (var i = 0; i < stores.length; i++) {
-      await processStore(browser, stores[i]);
+    if (!baselineBuffer) {
+      await supabase.from('stores').update({ baseline_homepage_url: screenshotUrl }).eq('id', id);
+      log('Missing baseline — reset');
+      return;
     }
 
-    await browser.close();
-    log('All stores processed. Done.');
+    diffResult = compareImages(baselineBuffer, buffer);
+
+    if (diffResult.dimensionChanged) {
+      await supabase.from('stores').update({ baseline_homepage_url: screenshotUrl }).eq('id', id);
+      log('Dimensions changed — baseline updated');
+      return;
+    }
+
+    if (diffResult.hasSignificantDiff) {
+      const { data: alert, error } = await supabase
+        .from('alerts')
+        .insert({
+          store_id: id,
+          step: 'homepage',
+          before_url: baseline_homepage_url,
+          after_url: screenshotUrl,
+          diff_percentage: diffResult.diffPercentage,
+          type: diffResult.diffPercentage > 20 ? 'red' : 'yellow',
+        })
+        .select()
+        .single();
+
+      if (error) logError(`Alert insert failed: ${error.message}`);
+      else {
+        log(`Significant change: ${diffResult.diffPercentage}%`);
+        await sendAlertEmail(alert);
+      }
+    } else {
+      await supabase.from('stores').update({ baseline_homepage_url: screenshotUrl }).eq('id', id);
+      log(`No significant change: ${diffResult.diffPercentage}%`);
+    }
   } catch (err) {
-    logError('Fatal error: ' + err.message);
-    process.exit(1);
+    status = 'error';
+    errorMsg = err.message;
+    logError(`Store ${id} failed: ${err.message}`);
+
+    const failureKeywords = [
+      'ERR_NAME_NOT_RESOLVED',
+      'getaddrinfo',
+      'ECONNREFUSED',
+      'timeout',
+      'ENOTFOUND',
+      'ERR_CONNECTION_REFUSED',
+      'ERR_CONNECTION_TIMED_OUT',
+    ];
+
+    if (failureKeywords.some((kw) => err.message.includes(kw))) {
+      const { data: current } = await supabase
+        .from('stores')
+        .select('failed_attempts')
+        .eq('id', id)
+        .single();
+
+      const count = (current?.failed_attempts ?? 0) + 1;
+      const update = { failed_attempts: count };
+
+      if (count >= MAX_FAILURES_BEFORE_INACTIVE) {
+        update.status = 'inactive';
+        log(`Store ${id} inactivated after ${count} consecutive failures`);
+      }
+
+      await supabase.from('stores').update(update).eq('id', id);
+      log(`Failure count for ${id}: ${count}`);
+    }
+  } finally {
+    if (page) await page.close();
+
+    await supabase
+      .from('stores')
+      .update({ last_checked: new Date().toISOString() })
+      .eq('id', id);
+
+    await supabase.from('runs').insert({
+      store_id: id,
+      started_at: runStart,
+      finished_at: new Date().toISOString(),
+      status,
+      error_message: errorMsg,
+      screenshot_url: screenshotUrl,
+      diff_percentage: diffResult?.diffPercentage ?? null,
+    });
   }
 }
 
-main();
+async function runAllChecks() {
+  if (isRunning) {
+    log('Cycle still running — skipping');
+    return;
+  }
+
+  isRunning = true;
+  log('Starting check cycle');
+
+  try {
+    const { data: stores, error } = await supabase
+      .from('stores')
+      .select('id, url, baseline_homepage_url, check_interval_minutes')
+      .eq('status', 'active');
+
+    if (error) throw error;
+    if (!stores?.length) {
+      log('No active stores');
+      return;
+    }
+
+    log(`Processing ${stores.length} stores`);
+
+    const browser = await puppeteer.connect({
+      browserWSEndpoint: `wss://chrome.browserless.io?token=${process.env.BROWSERLESS_API_KEY}`,
+      ignoreHTTPSErrors: true,
+    });
+
+    for (const store of stores) {
+      await processStore(browser, store);
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+
+    await browser.close();
+    log('Cycle finished');
+  } catch (err) {
+    logError(`Cycle error: ${err.message}`);
+  } finally {
+    isRunning = false;
+  }
+}
+
+// ────────────────────────────────────────────────
+// Start scheduler
+// ────────────────────────────────────────────────
+
+cron.schedule('*/5 * * * *', runAllChecks);
+
+log('Worker started');
+log('Checks every 5 minutes');
+
+process.on('SIGTERM', () => {
+  log('SIGTERM received — shutting down');
+  process.exit(0);
+});

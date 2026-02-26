@@ -1,5 +1,6 @@
 node_modules/
 .env
+.env.local     # ← good addition, even if unused here
 .DS_Store
 *.log
 *.png

@@ -12,6 +12,7 @@
     "@aws-sdk/client-s3": "^3.997.0",
     "@supabase/supabase-js": "^2.97.0",
     "dotenv": "^17.3.1",
+    "node-cron": "^4.2.1",
     "pixelmatch": "^7.1.0",
     "pngjs": "^7.0.0",
     "puppeteer": "^24.37.5",
