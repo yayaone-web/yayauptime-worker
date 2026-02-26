@@ -12,7 +12,7 @@
  * - Basic ping monitoring (up/down, response time, consecutive down alerts)
  * - Bot identity + CSS noise hiding for cleaner screenshots
  * - R2 uploads with compression (sharp) + long-term caching
- * - Visual diff: Ghost overlay (actual screenshot + semi-transparent red highlights)
+ * - Visual diff image: Ghost overlay (actual screenshot with semi-transparent red highlights)
  * - Clean error handling & logging
  *
  * Last major update: February 26, 2026
@@ -112,7 +112,7 @@ function extractR2Key(publicUrl) {
 }
 
 // ────────────────────────────────────────────────
-// Your Improved compareImages Function
+// Improved Ghost Overlay compareImages (your version)
 // ────────────────────────────────────────────────
 
 async function compareImages(baselineBuffer, newBuffer, id, timestamp) {
@@ -136,7 +136,7 @@ async function compareImages(baselineBuffer, newBuffer, id, timestamp) {
    
     // 1. Get the raw buffer from pngjs
     const rawDiffBuffer = PNG.sync.write(diff);
-    // 2. Compress with sharp to keep file size small (~200KB)
+    // 2. CRITICAL: Use Sharp to compress the 15MB raw data into a 200KB PNG
     const optimizedDiffBuffer = await sharp(rawDiffBuffer)
       .png({ compressionLevel: 9, adaptiveFiltering: true })
       .toBuffer();
