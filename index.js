@@ -6,15 +6,14 @@
  * Also runs basic ping monitoring every 5 minutes (free tier acquisition funnel).
  *
  * Features:
- * - Cron scheduling with overlap guard (prevents overlapping runs)
- * - 5-second delay between stores (protects Browserless rate limits)
+ * - Cron scheduling with overlap guard
+ * - 5-second inter-store delay (Browserless rate-limit safety)
  * - Failed attempt tracking + auto-inactivation after 5 consecutive failures
- * - Basic ping monitoring (up/down status, response time, alerts on consecutive downtime)
- * - Bot identity headers + User-Agent to avoid blocking
- * - CSS injection to hide noise (cookie banners, popups, chat widgets, etc.)
- * - R2 uploads with long-term caching (1-year cache)
- * - Visual diff image upload for debugging (shows red pixels where changes occur)
- * - Clean, readable code with detailed comments for future maintenance
+ * - Basic ping monitoring (up/down, response time, consecutive down alerts)
+ * - Bot identity + CSS noise hiding for cleaner screenshots
+ * - R2 uploads with compression (sharp) + long-term caching
+ * - Visual diff: Ghost overlay (actual screenshot + semi-transparent red highlights)
+ * - Clean error handling & logging
  *
  * Last major update: February 26, 2026
  */
@@ -28,6 +27,7 @@ const { S3Client, GetObjectCommand, PutObjectCommand } = require('@aws-sdk/clien
 const { PNG } = require('pngjs');
 const { Resend } = require('resend');
 const pixelmatch = require('pixelmatch').default || require('pixelmatch');
+const sharp = require('sharp');
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 
@@ -46,7 +46,7 @@ const s3 = new S3Client({
 });
 
 const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL || 'https://pub-9b659287417143e2a5f69b43384c4039.r2.dev';
-const DIFF_THRESHOLD_PERCENT = 2; // temporary for debugging (increase back to 5 once tuned)
+const DIFF_THRESHOLD_PERCENT = 5;
 const MAX_FAILURES_BEFORE_INACTIVE = 5;
 
 let isRunningVisual = false;
@@ -73,13 +73,17 @@ function ensureHttps(url) {
 }
 
 async function uploadToR2(buffer, key) {
+  const compressed = await sharp(buffer)
+    .png({ quality: 90, compressionLevel: 9 })
+    .toBuffer();
+
   await s3.send(
     new PutObjectCommand({
       Bucket: 'yaya-screenshots',
       Key: key,
-      Body: buffer,
+      Body: compressed,
       ContentType: 'image/png',
-      CacheControl: 'public, max-age=31536000', // 1-year cache for fast loading
+      CacheControl: 'public, max-age=31536000',
     })
   );
   return `${R2_PUBLIC_URL}/${key}`;
@@ -107,55 +111,50 @@ function extractR2Key(publicUrl) {
   }
 }
 
-/**
- * Compares two PNG buffers pixel-by-pixel using pixelmatch.
- * Returns difference percentage and uploads a visual diff image for debugging.
- * @param {Buffer} baselineBuffer - Baseline image buffer
- * @param {Buffer} newBuffer - New screenshot buffer
- * @param {string} id - Store ID (for diff file naming)
- * @param {string} timestamp - Timestamp for unique diff filename
- * @returns {Object} { hasSignificantDiff, diffPercentage, dimensionChanged? }
- */
-function compareImages(baselineBuffer, newBuffer, id, timestamp) {
-  if (!baselineBuffer || !newBuffer) {
-    return { hasSignificantDiff: true, diffPercentage: 100 };
-  }
+// ────────────────────────────────────────────────
+// Your Improved compareImages Function
+// ────────────────────────────────────────────────
 
-  let baselinePng, newPng;
+async function compareImages(baselineBuffer, newBuffer, id, timestamp) {
   try {
-    baselinePng = PNG.sync.read(baselineBuffer);
-    newPng = PNG.sync.read(newBuffer);
+    const baselinePng = PNG.sync.read(baselineBuffer);
+    const newPng = PNG.sync.read(newBuffer);
+    const { width, height } = baselinePng;
+
+    if (width !== newPng.width || height !== newPng.height) {
+      return { hasSignificantDiff: false, dimensionChanged: true };
+    }
+
+    const diff = new PNG({ width, height });
+   
+    // Create the ghost overlay
+    const numDiffPixels = pixelmatch(baselinePng.data, newPng.data, diff.data, width, height, {
+      threshold: 0.1,
+      alpha: 0.5,
+    });
+    const diffPercentage = (numDiffPixels / (width * height)) * 100;
+   
+    // 1. Get the raw buffer from pngjs
+    const rawDiffBuffer = PNG.sync.write(diff);
+    // 2. Compress with sharp to keep file size small (~200KB)
+    const optimizedDiffBuffer = await sharp(rawDiffBuffer)
+      .png({ compressionLevel: 9, adaptiveFiltering: true })
+      .toBuffer();
+
+    const diffKey = `diffs/${id}/${timestamp}-diff.png`;
+    const diffUrl = await uploadToR2(optimizedDiffBuffer, diffKey);
+
+    log(`Ghost overlay diff uploaded: ${diffPercentage.toFixed(2)}%`);
+
+    return {
+      hasSignificantDiff: diffPercentage > DIFF_THRESHOLD_PERCENT,
+      diffPercentage: Math.round(diffPercentage * 100) / 100,
+      diffUrl
+    };
   } catch (err) {
-    logError(`PNG decode failed: ${err.message}`);
-    return { hasSignificantDiff: true, diffPercentage: 100 };
+    logError(`Comparison failed: ${err.message}`);
+    return { hasSignificantDiff: false, error: true };
   }
-
-  const { width: w1, height: h1 } = baselinePng;
-  const { width: w2, height: h2 } = newPng;
-
-  if (w1 !== w2 || h1 !== h2) {
-    log(`Dimension change: ${w1}x${h1} → ${w2}x${h2}`);
-    return { hasSignificantDiff: false, diffPercentage: 0, dimensionChanged: true };
-  }
-
-  const diff = new Uint8Array(w1 * h1 * 4);
-  const numDiffPixels = pixelmatch(baselinePng.data, newPng.data, diff, w1, h1, {
-    threshold: 0.1,
-    ignoreColor: true, // ignore minor color shifts (reduces false positives from anti-aliasing)
-  });
-
-  const diffPercentage = (numDiffPixels / (w1 * h1)) * 100;
-
-  // Upload diff image for debugging (red pixels show where differences were detected)
-  const diffKey = `diffs/${id}/${timestamp}-diff.png`;
-  const diffBuffer = Buffer.from(diff);
-  uploadToR2(diffBuffer, diffKey).catch(err => logError(`Diff upload failed: ${err.message}`));
-  log(`Diff image uploaded: ${diffKey}`);
-
-  return {
-    hasSignificantDiff: diffPercentage > DIFF_THRESHOLD_PERCENT,
-    diffPercentage: Math.round(diffPercentage * 100) / 100,
-  };
 }
 
 // ────────────────────────────────────────────────
@@ -215,6 +214,7 @@ async function sendAlertEmail(alert, type = 'visual') {
       <div class="screenshots">
         <div><p><strong>Before</strong></p><img src="${alert.before_url}" class="screenshot" alt="Before"></div>
         <div><p><strong>After</strong></p><img src="${alert.after_url}" class="screenshot" alt="After"></div>
+        ${alert.diff_url ? `<div><p><strong>Highlighted Diff</strong></p><img src="${alert.diff_url}" class="screenshot" alt="Diff"></div>` : ''}
       </div>
       <a href="https://www.yayauptime.com/dashboard/alerts/${alert.id}" class="cta">VIEW IN DASHBOARD →</a>
       <p style="margin-top:30px; color:#666; font-size:13px;">YAYA Uptime • Visual Store Monitoring</p>
@@ -300,7 +300,7 @@ async function pingStore(store) {
 }
 
 // ────────────────────────────────────────────────
-// Core Visual Processing (Mission 2.5 fully patched)
+// Core Visual Processing
 // ────────────────────────────────────────────────
 
 async function processStore(browser, store) {
@@ -318,7 +318,6 @@ async function processStore(browser, store) {
   try {
     page = await browser.newPage();
 
-    // Mission 2.5: Bot identity (helps avoid blocking)
     await page.setExtraHTTPHeaders({
       'X-YAYA-Uptime': 'true',
       'X-Purpose': 'Uptime Monitoring with consent',
@@ -328,7 +327,6 @@ async function processStore(browser, store) {
       'Mozilla/5.0 (compatible; YAYA Uptime Bot/1.0; +https://yayauptime.com/bot)'
     );
 
-    // Mission 2.5: Hide common noise elements (expanded selector set)
     await page.addStyleTag({
       content: `
         [id*="cookie"], [class*="cookie"], [class*="gdpr"], [class*="consent"],
@@ -390,7 +388,7 @@ async function processStore(browser, store) {
       return;
     }
 
-    diffResult = compareImages(baselineBuffer, buffer, id, timestamp);
+    diffResult = await compareImages(baselineBuffer, buffer, id, timestamp);
 
     if (diffResult.dimensionChanged) {
       await supabase.from('stores').update({ baseline_homepage_url: screenshotUrl }).eq('id', id);
@@ -406,6 +404,7 @@ async function processStore(browser, store) {
           step: 'homepage',
           before_url: baseline_homepage_url,
           after_url: screenshotUrl,
+          diff_url: diffResult.diffUrl,
           diff_percentage: diffResult.diffPercentage,
           type: diffResult.diffPercentage > 20 ? 'red' : 'yellow',
         })
